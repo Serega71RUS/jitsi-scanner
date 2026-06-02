@@ -175,7 +175,9 @@ sudo systemctl stop jitsi-scanner
 | `state_file` | JSON-файл с состоянием последнего запуска |
 | `log_file` | Файл логов |
 | `max_workers` | Количество параллельных воркеров |
+| `max_candidate_workers_per_ip` | Количество параллельных проверок доменов-кандидатов внутри одного IP |
 | `connect_timeout_seconds` | Таймаут TCP/TLS-подключений |
+| `dns_timeout_seconds` | Таймаут DNS-запросов |
 | `request_timeout_seconds` | Таймаут HTTP-запросов |
 | `verify_tls` | Проверять TLS-сертификаты при HTTP-проверках |
 | `probe_http` | Проверять HTTP |
@@ -185,6 +187,18 @@ sudo systemctl stop jitsi-scanner
 | `follow_cross_host_redirects` | Разрешать засчитывать редиректы на другой домен |
 | `candidate_limit_per_ip` | Лимит доменов-кандидатов на один IP |
 | `jitsi_paths` | Пути, которые проверяются на домене |
+
+Для более быстрого сканирования можно повышать `max_workers` и
+`max_candidate_workers_per_ip`, но это увеличивает количество одновременных
+DNS/TCP/HTTP-запросов. Практичный старт для быстрых сетей:
+
+```json
+"max_workers": 128,
+"max_candidate_workers_per_ip": 12,
+"connect_timeout_seconds": 3,
+"dns_timeout_seconds": 2,
+"request_timeout_seconds": 5
+```
 
 Создать конфиг со значениями по умолчанию:
 

@@ -24,24 +24,26 @@ import (
 )
 
 type Config struct {
-	SourceURL                  string   `json:"source_url"`
-	ScanIntervalSeconds        int      `json:"scan_interval_seconds"`
-	OutputFile                 string   `json:"output_file"`
-	DetailsFile                string   `json:"details_file"`
-	StateFile                  string   `json:"state_file"`
-	LogFile                    string   `json:"log_file"`
-	MaxWorkers                 int      `json:"max_workers"`
-	ConnectTimeoutSeconds      int      `json:"connect_timeout_seconds"`
-	RequestTimeoutSeconds      int      `json:"request_timeout_seconds"`
-	VerifyTLS                  bool     `json:"verify_tls"`
-	ProbeHTTP                  bool     `json:"probe_http"`
-	ProbeHTTPS                 bool     `json:"probe_https"`
-	RequireDomainResolvesToIP  bool     `json:"require_domain_resolves_to_ip"`
-	ForceProbeIP               bool     `json:"force_probe_ip"`
-	FollowCrossHostRedirects   bool     `json:"follow_cross_host_redirects"`
-	UserAgent                  string   `json:"user_agent"`
-	CandidateLimitPerIP        int      `json:"candidate_limit_per_ip"`
-	JitsiPaths                 []string `json:"jitsi_paths"`
+	SourceURL                 string   `json:"source_url"`
+	ScanIntervalSeconds       int      `json:"scan_interval_seconds"`
+	OutputFile                string   `json:"output_file"`
+	DetailsFile               string   `json:"details_file"`
+	StateFile                 string   `json:"state_file"`
+	LogFile                   string   `json:"log_file"`
+	MaxWorkers                int      `json:"max_workers"`
+	MaxCandidateWorkersPerIP  int      `json:"max_candidate_workers_per_ip"`
+	ConnectTimeoutSeconds     int      `json:"connect_timeout_seconds"`
+	DNSTimeoutSeconds         int      `json:"dns_timeout_seconds"`
+	RequestTimeoutSeconds     int      `json:"request_timeout_seconds"`
+	VerifyTLS                 bool     `json:"verify_tls"`
+	ProbeHTTP                 bool     `json:"probe_http"`
+	ProbeHTTPS                bool     `json:"probe_https"`
+	RequireDomainResolvesToIP bool     `json:"require_domain_resolves_to_ip"`
+	ForceProbeIP              bool     `json:"force_probe_ip"`
+	FollowCrossHostRedirects  bool     `json:"follow_cross_host_redirects"`
+	UserAgent                 string   `json:"user_agent"`
+	CandidateLimitPerIP       int      `json:"candidate_limit_per_ip"`
+	JitsiPaths                []string `json:"jitsi_paths"`
 }
 
 type Finding struct {
@@ -69,7 +71,9 @@ func defaultConfig() Config {
 		StateFile:                 "scanner_state.json",
 		LogFile:                   "jitsi_scanner.log",
 		MaxWorkers:                64,
+		MaxCandidateWorkersPerIP:  8,
 		ConnectTimeoutSeconds:     5,
+		DNSTimeoutSeconds:         3,
 		RequestTimeoutSeconds:     8,
 		VerifyTLS:                 false,
 		ProbeHTTP:                 true,
@@ -154,8 +158,14 @@ func loadConfig(path string) (Config, error) {
 	if cfg.MaxWorkers < 1 {
 		cfg.MaxWorkers = 1
 	}
+	if cfg.MaxCandidateWorkersPerIP < 1 {
+		cfg.MaxCandidateWorkersPerIP = 1
+	}
 	if cfg.ConnectTimeoutSeconds < 1 {
 		cfg.ConnectTimeoutSeconds = 1
+	}
+	if cfg.DNSTimeoutSeconds < 1 {
+		cfg.DNSTimeoutSeconds = 1
 	}
 	if cfg.RequestTimeoutSeconds < 1 {
 		cfg.RequestTimeoutSeconds = 1
@@ -395,24 +405,74 @@ func ensureParentDir(path string) error {
 
 func scanIP(ip string, cfg Config) []Finding {
 	findings := make([]Finding, 0)
-	for _, domain := range candidateDomains(ip, cfg) {
-		if finding, ok := validateJitsi(domain, ip, cfg); ok {
-			findings = append(findings, finding)
-		}
+	domains := candidateDomains(ip, cfg)
+	if len(domains) == 0 {
+		return findings
 	}
+
+	jobs := make(chan string)
+	results := make(chan Finding)
+	var wg sync.WaitGroup
+	workerCount := cfg.MaxCandidateWorkersPerIP
+	if workerCount > len(domains) {
+		workerCount = len(domains)
+	}
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for domain := range jobs {
+				if finding, ok := validateJitsi(domain, ip, cfg); ok {
+					results <- finding
+				}
+			}
+		}()
+	}
+
+	go func() {
+		for _, domain := range domains {
+			jobs <- domain
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+
+	for finding := range results {
+		findings = append(findings, finding)
+	}
+	sort.Slice(findings, func(i, j int) bool {
+		if findings[i].Domain == findings[j].Domain {
+			return findings[i].IP < findings[j].IP
+		}
+		return findings[i].Domain < findings[j].Domain
+	})
 	return findings
 }
 
 func candidateDomains(ip string, cfg Config) []string {
 	seen := make(map[string]bool)
-	for _, domain := range ptrCandidates(ip) {
-		seen[domain] = true
+	sources := []func() []string{
+		func() []string { return ptrCandidates(ip, cfg) },
+		func() []string { return certificateCandidates(ip, cfg) },
+		func() []string { return redirectCandidates(ip, cfg) },
 	}
-	for _, domain := range certificateCandidates(ip, cfg) {
-		seen[domain] = true
+	results := make(chan []string, len(sources))
+	var wg sync.WaitGroup
+	for _, source := range sources {
+		wg.Add(1)
+		go func(source func() []string) {
+			defer wg.Done()
+			results <- source()
+		}(source)
 	}
-	for _, domain := range redirectCandidates(ip, cfg) {
-		seen[domain] = true
+	wg.Wait()
+	close(results)
+
+	for domains := range results {
+		for _, domain := range domains {
+			seen[domain] = true
+		}
 	}
 
 	domains := make([]string, 0, len(seen))
@@ -426,8 +486,11 @@ func candidateDomains(ip string, cfg Config) []string {
 	return domains
 }
 
-func ptrCandidates(ip string) []string {
-	names, err := net.LookupAddr(ip)
+func ptrCandidates(ip string, cfg Config) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.DNSTimeoutSeconds)*time.Second)
+	defer cancel()
+
+	names, err := net.DefaultResolver.LookupAddr(ctx, ip)
 	if err != nil {
 		return nil
 	}
@@ -541,7 +604,7 @@ func normalizeHostname(value string) string {
 }
 
 func validateJitsi(domain string, ip string, cfg Config) (Finding, bool) {
-	if cfg.RequireDomainResolvesToIP && !domainResolvesToIP(domain, ip) {
+	if cfg.RequireDomainResolvesToIP && !domainResolvesToIP(domain, ip, cfg) {
 		return Finding{}, false
 	}
 
@@ -578,13 +641,16 @@ func probeSchemes(cfg Config) []string {
 	return schemes
 }
 
-func domainResolvesToIP(domain string, ip string) bool {
-	resolved, err := net.LookupIP(domain)
+func domainResolvesToIP(domain string, ip string, cfg Config) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.DNSTimeoutSeconds)*time.Second)
+	defer cancel()
+
+	resolved, err := net.DefaultResolver.LookupIPAddr(ctx, domain)
 	if err != nil {
 		return false
 	}
 	for _, item := range resolved {
-		if item.String() == ip {
+		if item.IP.String() == ip {
 			return true
 		}
 	}

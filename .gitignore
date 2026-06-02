@@ -1,6 +1,9 @@
 config.json
+.idea/
 jitsi-scanner
 jitsi-scanner.exe
 found_jitsi_details.tsv
 scanner_state.json
 jitsi_scanner.log
+*.test
+coverage.out
