@@ -32,6 +32,8 @@ type Config struct {
 	LogFile                   string   `json:"log_file"`
 	MaxWorkers                int      `json:"max_workers"`
 	MaxCandidateWorkersPerIP  int      `json:"max_candidate_workers_per_ip"`
+	MaxNetworkConcurrency     int      `json:"max_network_concurrency"`
+	NetworkRequestsPerSecond  int      `json:"network_requests_per_second"`
 	ConnectTimeoutSeconds     int      `json:"connect_timeout_seconds"`
 	DNSTimeoutSeconds         int      `json:"dns_timeout_seconds"`
 	RequestTimeoutSeconds     int      `json:"request_timeout_seconds"`
@@ -61,6 +63,12 @@ type State struct {
 }
 
 var ipRegexp = regexp.MustCompile(`(?:\d{1,3}\.){3}\d{1,3}`)
+var networkLimiter *NetworkLimiter
+
+type NetworkLimiter struct {
+	slots  chan struct{}
+	ticker *time.Ticker
+}
 
 func defaultConfig() Config {
 	return Config{
@@ -71,7 +79,9 @@ func defaultConfig() Config {
 		StateFile:                 "scanner_state.json",
 		LogFile:                   "jitsi_scanner.log",
 		MaxWorkers:                64,
-		MaxCandidateWorkersPerIP:  8,
+		MaxCandidateWorkersPerIP:  4,
+		MaxNetworkConcurrency:     32,
+		NetworkRequestsPerSecond:  12,
 		ConnectTimeoutSeconds:     5,
 		DNSTimeoutSeconds:         3,
 		RequestTimeoutSeconds:     8,
@@ -161,6 +171,12 @@ func loadConfig(path string) (Config, error) {
 	if cfg.MaxCandidateWorkersPerIP < 1 {
 		cfg.MaxCandidateWorkersPerIP = 1
 	}
+	if cfg.MaxNetworkConcurrency < 1 {
+		cfg.MaxNetworkConcurrency = 1
+	}
+	if cfg.NetworkRequestsPerSecond < 0 {
+		cfg.NetworkRequestsPerSecond = 0
+	}
 	if cfg.ConnectTimeoutSeconds < 1 {
 		cfg.ConnectTimeoutSeconds = 1
 	}
@@ -194,6 +210,42 @@ func setupLogging(cfg Config) (func(), error) {
 	return func() { _ = file.Close() }, nil
 }
 
+func setupNetworkLimiter(cfg Config) func() {
+	limiter := &NetworkLimiter{
+		slots: make(chan struct{}, cfg.MaxNetworkConcurrency),
+	}
+	if cfg.NetworkRequestsPerSecond > 0 {
+		interval := time.Second / time.Duration(cfg.NetworkRequestsPerSecond)
+		if interval < time.Millisecond {
+			interval = time.Millisecond
+		}
+		limiter.ticker = time.NewTicker(interval)
+	}
+	networkLimiter = limiter
+	return func() {
+		if limiter.ticker != nil {
+			limiter.ticker.Stop()
+		}
+		if networkLimiter == limiter {
+			networkLimiter = nil
+		}
+	}
+}
+
+func acquireNetworkSlot() func() {
+	limiter := networkLimiter
+	if limiter == nil {
+		return func() {}
+	}
+	if limiter.ticker != nil {
+		<-limiter.ticker.C
+	}
+	limiter.slots <- struct{}{}
+	return func() {
+		<-limiter.slots
+	}
+}
+
 func runForever(cfg Config) {
 	for {
 		started := time.Now()
@@ -210,6 +262,9 @@ func runForever(cfg Config) {
 }
 
 func runOnce(cfg Config) (int, error) {
+	closeLimiter := setupNetworkLimiter(cfg)
+	defer closeLimiter()
+
 	log.Printf("Downloading IP list from %s", cfg.SourceURL)
 	text, err := fetchText(cfg.SourceURL, cfg)
 	if err != nil {
@@ -247,6 +302,8 @@ func runOnce(cfg Config) (int, error) {
 
 	foundThisRun := 0
 	scanned := 0
+	lastProgressAt := time.Now()
+	log.Printf("Scan started with %d workers, network limit %d concurrent / %d per second", cfg.MaxWorkers, cfg.MaxNetworkConcurrency, cfg.NetworkRequestsPerSecond)
 	for findings := range results {
 		scanned++
 		for _, finding := range findings {
@@ -265,8 +322,9 @@ func runOnce(cfg Config) (int, error) {
 			foundThisRun++
 			log.Printf("Found Jitsi domain: %s (%s)", finding.Domain, finding.IP)
 		}
-		if scanned%100 == 0 {
+		if scanned%100 == 0 || time.Since(lastProgressAt) >= 10*time.Second {
 			log.Printf("Progress: %d/%d IPs scanned", scanned, len(ips))
+			lastProgressAt = time.Now()
 		}
 	}
 
@@ -293,6 +351,9 @@ func fetchText(rawURL string, cfg Config) (string, error) {
 		return "", err
 	}
 	req.Header.Set("User-Agent", cfg.UserAgent)
+
+	release := acquireNetworkSlot()
+	defer release()
 
 	client := &http.Client{Timeout: time.Duration(cfg.RequestTimeoutSeconds) * time.Second}
 	resp, err := client.Do(req)
@@ -487,6 +548,9 @@ func candidateDomains(ip string, cfg Config) []string {
 }
 
 func ptrCandidates(ip string, cfg Config) []string {
+	release := acquireNetworkSlot()
+	defer release()
+
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.DNSTimeoutSeconds)*time.Second)
 	defer cancel()
 
@@ -498,6 +562,9 @@ func ptrCandidates(ip string, cfg Config) []string {
 }
 
 func certificateCandidates(ip string, cfg Config) []string {
+	release := acquireNetworkSlot()
+	defer release()
+
 	dialer := &net.Dialer{Timeout: time.Duration(cfg.ConnectTimeoutSeconds) * time.Second}
 	conn, err := tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(ip, "443"), &tls.Config{
 		InsecureSkipVerify: true,
@@ -540,12 +607,16 @@ func redirectCandidates(ip string, cfg Config) []string {
 			continue
 		}
 		req.Header.Set("User-Agent", cfg.UserAgent)
+
+		release := acquireNetworkSlot()
 		resp, err := client.Do(req)
 		if err != nil {
+			release()
 			continue
 		}
 		location := resp.Header.Get("Location")
 		_ = resp.Body.Close()
+		release()
 		if location == "" || resp.StatusCode < 300 || resp.StatusCode >= 400 {
 			continue
 		}
@@ -642,6 +713,9 @@ func probeSchemes(cfg Config) []string {
 }
 
 func domainResolvesToIP(domain string, ip string, cfg Config) bool {
+	release := acquireNetworkSlot()
+	defer release()
+
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.DNSTimeoutSeconds)*time.Second)
 	defer cancel()
 
@@ -788,6 +862,9 @@ func fetchURL(rawURL string, probeDomain string, probeIP string, cfg Config) (in
 		return 0, "", "", err
 	}
 	req.Header.Set("User-Agent", cfg.UserAgent)
+	release := acquireNetworkSlot()
+	defer release()
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, "", "", err

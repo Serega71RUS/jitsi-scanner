@@ -176,6 +176,8 @@ sudo systemctl stop jitsi-scanner
 | `log_file` | Файл логов |
 | `max_workers` | Количество параллельных воркеров |
 | `max_candidate_workers_per_ip` | Количество параллельных проверок доменов-кандидатов внутри одного IP |
+| `max_network_concurrency` | Общий лимит одновременных DNS/TCP/HTTP-операций |
+| `network_requests_per_second` | Лимит старта новых сетевых операций в секунду. `0` отключает лимит частоты |
 | `connect_timeout_seconds` | Таймаут TCP/TLS-подключений |
 | `dns_timeout_seconds` | Таймаут DNS-запросов |
 | `request_timeout_seconds` | Таймаут HTTP-запросов |
@@ -188,17 +190,36 @@ sudo systemctl stop jitsi-scanner
 | `candidate_limit_per_ip` | Лимит доменов-кандидатов на один IP |
 | `jitsi_paths` | Пути, которые проверяются на домене |
 
-Для более быстрого сканирования можно повышать `max_workers` и
-`max_candidate_workers_per_ip`, но это увеличивает количество одновременных
-DNS/TCP/HTTP-запросов. Практичный старт для быстрых сетей:
+`max_workers` и `max_candidate_workers_per_ip` управляют количеством работы в
+очереди, а `max_network_concurrency` и `network_requests_per_second` ограничивают
+реальную сетевую нагрузку на роутер. Если роутер слабый или во время скана
+тормозит интернет, используйте бережный профиль:
 
 ```json
-"max_workers": 128,
-"max_candidate_workers_per_ip": 12,
-"connect_timeout_seconds": 3,
-"dns_timeout_seconds": 2,
-"request_timeout_seconds": 5
+"max_workers": 64,
+"max_candidate_workers_per_ip": 2,
+"max_network_concurrency": 32,
+"network_requests_per_second": 16,
+"connect_timeout_seconds": 4,
+"dns_timeout_seconds": 3,
+"request_timeout_seconds": 6
 ```
+
+Если роутер почти не загружен, можно перейти на быстрый профиль:
+
+```json
+"max_workers": 320,
+"max_candidate_workers_per_ip": 4,
+"max_network_concurrency": 256,
+"network_requests_per_second": 120,
+"connect_timeout_seconds": 4,
+"dns_timeout_seconds": 3,
+"request_timeout_seconds": 6
+```
+
+Дальше поднимайте `network_requests_per_second` ступенями: 150, затем 180.
+Если во время сканирования начинает тормозить интернет, сначала снижайте
+`network_requests_per_second`, затем `max_network_concurrency`.
 
 Создать конфиг со значениями по умолчанию:
 
